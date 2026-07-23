@@ -1,11 +1,12 @@
 {
   "name": "torch-distributed",
   "displayName": "PyTorch Distributed Training Tools",
-  "version": "0.1.0",
-  "description": "Debugging tools for PyTorch distributed training hangs. Currently focused on NCCL deadlock diagnosis with plans to expand to broader distributed debugging.",
+  "version": "0.2.0",
+  "description": "Debugging and implementation tools for PyTorch distributed training. Covers NCCL deadlock diagnosis, hang pattern classification, and symmetric memory (async tensor parallelism, sequence parallelism, low-contention collectives).",
   "skills": "./skills/",
   "agents": [
-    "./agents/hang-debugger.md"
+    "./agents/hang-debugger.md",
+    "./agents/symm-mem-expert.md"
   ],
   "author": {
     "name": "TorchedHat"
@@ -18,6 +19,13 @@
     "NCCL",
     "deadlock",
     "hang",
-    "debugging"
+    "debugging",
+    "symmetric-memory",
+    "async-tp",
+    "tensor-parallelism",
+    "sequence-parallelism",
+    "fused-collectives",
+    "NVSwitch",
+    "NVSHMEM"
   ]
 }
