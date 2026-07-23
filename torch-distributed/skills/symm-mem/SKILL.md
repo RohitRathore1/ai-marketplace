@@ -67,12 +67,12 @@ Symm mem bypasses NCCL kernel launches by using direct GPU P2P reads/writes into
 | `fused_matmul_reduce_scatter` | `(A, B, reduce_op, scatter_dim, group_name)` | Async TP forward (row parallel) |
 | `fused_all_gather_scaled_matmul` | `(A, Bs, A_scale, B_scales, ...)` | FP8 async TP |
 | `fused_scaled_matmul_reduce_scatter` | `(A, B, A_scale, B_scale, ...)` | FP8 reduce-scatter |
-| `_low_contention_all_gather` | `(tensor, group_name)` | SM-free gather when input is already in symm mem |
+| `_low_contention_all_gather` | `(tensor, group_name)` | SM-free gather when input is in symm mem; falls back to workspace copy + pull when not |
 | `_low_contention_reduce_scatter` | `(tensor, reduce_op, group_name)` | SM-free scatter |
 | `_low_contention_all_gather_ce_multicast` | `(tensor, group_name)` | NVSwitch copy-engine multicast gather |
 | `_low_contention_all_gather_ce_multicast_out` | `(tensor, group_name, out)` | CE multicast with preallocated out (CUDA graph safe) |
 | `get_remote_tensors` | `(x, group_name)` | Direct P2P tensor views — all ranks |
-| `all_to_all_nd` | `(input, group_name, ...)` | Ulysses-style sequence parallel |
+| `all_to_all_nd` | `(input, out, scatter_dim, gather_dim, *, group)` | Ulysses-style sequence parallel |
 
 ### Handle Methods (returned by `rendezvous`)
 
@@ -150,8 +150,6 @@ from torch.distributed._symmetric_memory import (
     empty, rendezvous, get_symm_mem_workspace,
     set_backend, set_signal_pad_size,
 )
-import torch.ops.symm_mem as symm_mem_ops
-
 # --- Allocation pattern ---
 # allocate before CUDA graph capture
 tensor = empty(numel, dtype=torch.float16, device="cuda")

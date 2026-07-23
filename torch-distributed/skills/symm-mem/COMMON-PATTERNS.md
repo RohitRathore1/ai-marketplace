@@ -157,22 +157,38 @@ class AsyncTPLinearRS(nn.Module):
 
 Ulysses-style sequence parallelism exchanges sequence chunks so each rank processes a full sequence slice for its attention heads.
 
+`all_to_all_nd` is a Python function (not `torch.ops.symm_mem`); `input` must be in symmetric memory and `out` must be pre-allocated. It dispatches internally to `torch.ops.symm_mem.nccl_all_to_all_nd`.
+
 ```python
-import torch.ops.symm_mem
+from torch.distributed._symmetric_memory import empty, rendezvous, all_to_all_nd
 
 
-def ulysses_all_to_all(x: torch.Tensor, pg: dist.ProcessGroup) -> torch.Tensor:
+def ulysses_all_to_all(
+    x_shard: torch.Tensor,   # [seq_local, num_heads, head_dim] in symm mem
+    pg: dist.ProcessGroup,
+) -> torch.Tensor:
     """
-    Input:  [seq_len // world_size, num_heads, head_dim]
-    Output: [seq_len, num_heads // world_size, head_dim]
+    scatter_dim=0 (sequence), gather_dim=1 (heads):
+      input:  [G * seq_local, num_heads, head_dim]  -- or [G, seq_local, num_heads, head_dim]
+      output: [seq_local, G * num_heads, head_dim]  -- or [seq_local, G, num_heads, head_dim]
     """
-    return torch.ops.symm_mem.all_to_all_nd(
-        x,
-        group_name=pg.group_name,
+    G = pg.size()
+    seq_local = x_shard.shape[0] // G
+    num_heads = x_shard.shape[1]
+    head_dim = x_shard.shape[2]
+    out = torch.empty(seq_local, G * num_heads, head_dim, dtype=x_shard.dtype, device=x_shard.device)
+
+    all_to_all_nd(
+        x_shard,
+        out,
+        scatter_dim=0,
+        gather_dim=1,
+        group=pg.group_name,
     )
+    return out
 ```
 
-**For custom split/merge dimensions** use the `in_splits` / `out_splits` arguments of `all_to_all_nd` (see `lib.define` in `__init__.py` for the `all_to_all_vdev_2d` family).
+**Supported (scatter_dim, gather_dim) pairs**: `(1, 0)` and `(0, 1)` only. See the docstring in `__init__.py:2541` for the exact input/output shape contracts.
 
 ---
 
@@ -298,23 +314,20 @@ import torch.ops.symm_mem
 
 
 def prepare_for_cuda_graph(
-    A_shard_shape, B_shape, group_name: str, world_size: int
-):
+    A_shard: torch.Tensor, B_shape: tuple, group_name: str, world_size: int
+) -> torch.Tensor:
     """Call this BEFORE torch.cuda.graph() context."""
-    local_M = A_shard_shape[0]
-    K = A_shard_shape[1]
-    # Workspace needed for AG: local_M * K * element_size
-    min_workspace = local_M * K * 2  # float16 = 2 bytes
+    # Workspace needed = size of one local shard in bytes
+    min_workspace = A_shard.numel() * A_shard.element_size()
     get_symm_mem_workspace(group_name, min_size=min_workspace)
 
-    # For CE multicast _out: pre-allocate output
-    out_shape = (A_shard_shape[0] * world_size, B_shape[1])
-    out = torch.empty(out_shape, dtype=torch.float16, device="cuda")
-    return out
+    # Pre-allocate output for CE multicast _out variant
+    out_shape = (A_shard.shape[0] * world_size, B_shape[1])
+    return torch.empty(out_shape, dtype=A_shard.dtype, device=A_shard.device)
 
 
 def run_with_cuda_graph(A_shard, B, out_buf, pg):
-    # Warmup
+    # Warmup (establishes workspace; must use same args as capture)
     for _ in range(3):
         torch.ops.symm_mem.fused_all_gather_matmul(
             A_shard, [B], gather_dim=0, group_name=pg.group_name
@@ -323,10 +336,11 @@ def run_with_cuda_graph(A_shard, B, out_buf, pg):
     # Capture
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        result = torch.ops.symm_mem.fused_all_gather_matmul(
-            A_shard, [B], gather_dim=0, group_name=pg.group_name
+        # Use CE multicast _out so output lands in pre-allocated out_buf
+        torch.ops.symm_mem._low_contention_all_gather_ce_multicast_out(
+            A_shard, group_name=pg.group_name, out=out_buf
         )
-    return g, result
+    return g, out_buf
 ```
 
 ---
@@ -427,8 +441,8 @@ t = symm_mem.empty(128, device="cuda")
 ### Skipping signal pad sizing for large world sizes with CE multicast
 
 ```python
-# WRONG: default signal_pad_size may be too small for large world_size
-# _check_lc_signal_pad_capacity raises RuntimeError silently
+# WRONG: default signal_pad_size may be too small for large world_size;
+# _check_lc_signal_pad_capacity will raise RuntimeError with a size mismatch message
 torch.ops.symm_mem._low_contention_all_gather_ce_multicast(t, group_name)
 
 # CORRECT: set signal pad size before any allocations
@@ -443,19 +457,28 @@ set_signal_pad_size(4 * 4 * world_size)   # 4 channels * sizeof(uint32) * world_
 
 ### Check which dispatch path fused_all_gather_matmul uses
 
+Print the gate conditions directly — the dispatch tree is deterministic given these values:
+
 ```python
+import math
 import os
-import logging
-logging.basicConfig(level=logging.DEBUG)
+from torch._C._autograd import DeviceType
+from torch._C._distributed_c10d import _SymmetricMemory
 
-# Enable native async TP path
-os.environ["TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP"] = "1"
+local_M = math.prod(A_shard.shape[:-1])
+global_M = local_M * world_size
+device_index = A_shard.device.index
+has_mc = _SymmetricMemory.has_multicast_support(DeviceType.CUDA, device_index)
+native_env = "TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP" in os.environ
 
-# Force fallback (Meta device registration fires for shape tracing)
-A_shard_meta = A_shard.to("meta")
-_ = torch.ops.symm_mem.fused_all_gather_matmul(
-    A_shard_meta, [B.to("meta")], gather_dim=0, group_name=pg.group_name
-)
+print(f"contiguous:   {A_shard.is_contiguous()}")
+print(f"gather_dim:   {gather_dim}  (must be 0 for native/multimem)")
+print(f"global_M:     {global_M}   (native: 2048<M<=4096, multimem: M<=2048)")
+print(f"num_B:        {len(Bs)}    (native: must be 1)")
+print(f"return_A:     {return_A}   (multimem: must be False)")
+print(f"multicast_hw: {has_mc}")
+print(f"native_env:   {native_env}")
+# Cross-reference against ARCHITECTURE.md dispatch tree to identify the path
 ```
 
 ### Verify multicast support on current hardware

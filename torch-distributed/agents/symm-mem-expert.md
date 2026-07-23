@@ -77,9 +77,10 @@ print(f"min_required (CE multicast): {4 * 4 * world_size}")
 
 **For workspace errors**:
 ```python
-from torch.distributed._symmetric_memory import get_symm_mem_workspace
-symm_mem = get_symm_mem_workspace(group_name, min_size=1)
-print(f"current workspace size: {symm_mem.world_size}")
+from torch.distributed._symmetric_memory import _group_name_to_workspace_tensor
+tensor = _group_name_to_workspace_tensor.get(group_name)
+size = tensor.numel() * tensor.element_size() if tensor is not None else 0
+print(f"current workspace size: {size} bytes (0 = not yet allocated)")
 ```
 
 **For rendezvous hangs** — verify tensor symmetry across ranks:
